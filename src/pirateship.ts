@@ -3,6 +3,7 @@
  */
 export {
   createPirateShipProvider,
+  FIRST_UPLOAD_MAPPING,
   parcelOrderId,
   splitParcelOrderId,
   parseCents,

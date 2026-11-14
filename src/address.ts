@@ -40,13 +40,39 @@ export function normalizeUsZip(input: string): string | null {
   return null;
 }
 
-/** "us", "USA", "United States", "" -> "US"; other values are upper-cased and trimmed. */
+/** Common English country names and ISO alpha-3 codes -> ISO 3166-1 alpha-2. */
+const COUNTRY_NAMES: Record<string, string> = {
+  us: 'US', usa: 'US', 'united states': 'US', 'united states of america': 'US', america: 'US',
+  canada: 'CA', can: 'CA', mexico: 'MX', mex: 'MX',
+  'united kingdom': 'GB', uk: 'GB', 'great britain': 'GB', britain: 'GB', england: 'GB', scotland: 'GB', wales: 'GB',
+  'northern ireland': 'GB', gbr: 'GB', ireland: 'IE', irl: 'IE',
+  germany: 'DE', deu: 'DE', france: 'FR', fra: 'FR', spain: 'ES', esp: 'ES', italy: 'IT', ita: 'IT',
+  portugal: 'PT', netherlands: 'NL', 'the netherlands': 'NL', holland: 'NL', nld: 'NL', belgium: 'BE',
+  switzerland: 'CH', austria: 'AT', sweden: 'SE', norway: 'NO', denmark: 'DK', finland: 'FI', iceland: 'IS',
+  poland: 'PL', 'czech republic': 'CZ', czechia: 'CZ', greece: 'GR', israel: 'IL', turkey: 'TR', turkiye: 'TR',
+  australia: 'AU', aus: 'AU', 'new zealand': 'NZ', nzl: 'NZ', japan: 'JP', jpn: 'JP', china: 'CN', chn: 'CN',
+  'south korea': 'KR', korea: 'KR', 'republic of korea': 'KR', taiwan: 'TW', 'hong kong': 'HK', singapore: 'SG',
+  india: 'IN', ind: 'IN', philippines: 'PH', thailand: 'TH', vietnam: 'VN', 'viet nam': 'VN', malaysia: 'MY',
+  indonesia: 'ID', brazil: 'BR', bra: 'BR', argentina: 'AR', chile: 'CL', colombia: 'CO', peru: 'PE',
+  'south africa': 'ZA', 'united arab emirates': 'AE', uae: 'AE', 'saudi arabia': 'SA',
+};
+
+/**
+ * "us", "USA", "United States", "" -> "US"; "Canada" -> "CA"; a 2-letter
+ * code is upper-cased. Anything else unrecognized is upper-cased and trimmed
+ * and is NOT valid ISO alpha-2: check with isIsoCountry().
+ */
 export function normalizeCountry(input: string | undefined): string {
   const t = (input ?? '').trim();
   if (!t) return 'US';
-  const n = t.toLowerCase().replace(/\./g, '');
-  if (n === 'us' || n === 'usa' || n === 'united states' || n === 'united states of america') return 'US';
+  const n = t.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+  if (Object.hasOwn(COUNTRY_NAMES, n)) return COUNTRY_NAMES[n]!;
   return t.toUpperCase();
+}
+
+/** True for a two-letter (ISO 3166-1 alpha-2 shaped) country code. */
+export function isIsoCountry(code: string): boolean {
+  return /^[A-Z]{2}$/.test(code);
 }
 
 export function isContiguousUs(state: string): boolean {

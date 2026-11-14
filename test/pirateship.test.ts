@@ -46,7 +46,7 @@ describe('provider metadata', () => {
     expect(ps.id).toBe('pirateship');
     expect(ps.displayName).toBe('Pirate Ship');
     expect(ps.appUrl).toBe(PIRATE_SHIP_APP_URL);
-    expect(ps.capabilities).toEqual({ exportFile: true, importTracking: true, purchaseLabel: false, rates: false });
+    expect(ps.capabilities).toEqual({ exportFile: true, importTracking: true, purchaseLabel: false, rates: false, track: false, voidLabel: false });
     expect(ps.purchaseLabel).toBeUndefined();
     expect(ps.getRates).toBeUndefined();
   });
@@ -106,9 +106,10 @@ describe('exportShipments', () => {
       },
     ]);
     expect(out.warnings).toEqual([
+      expect.objectContaining({ level: 'info', code: 'first_upload_mapping' }),
       expect.objectContaining({ level: 'info', code: 'buy_with_service', references: ['A-1'] }),
     ]);
-    expect(out.warnings[0]!.message).toContain('UPS® Ground');
+    expect(out.warnings[1]!.message).toContain('UPS® Ground');
   });
 
   it('splits weights into pounds + ounces exactly', () => {
@@ -342,7 +343,7 @@ describe('parseTrackingImport (fixture)', () => {
 
   it('reports skipped rows with their record numbers', () => {
     expect(res.errors).toEqual([
-      { row: 7, message: 'Label 1Z999AA10123456815 is "Refunded"; row skipped.' },
+      { row: 7, message: 'Label 1Z999AA10123456815 is "Refunded" (Tracking Status); row skipped.' },
       { row: 8, message: 'No tracking number; row skipped.' },
     ]);
   });

@@ -12,9 +12,10 @@
  * Early" must not resolve to "UPS Next Day Air".
  */
 
-import type { Carrier, ServiceSelection } from './types';
+import type { Carrier, KnownCarrier, ServiceSelection } from './types';
 
 export interface ServiceDefinition extends ServiceSelection {
+  carrier: KnownCarrier;
   /** Extra accepted spellings (normalized at lookup time). */
   aliases: string[];
   /** UPS Rating/Shipping API service code, for UPS services. */
@@ -24,7 +25,7 @@ export interface ServiceDefinition extends ServiceSelection {
 }
 
 function def(
-  carrier: Carrier,
+  carrier: KnownCarrier,
   code: string,
   name: string,
   aliases: string[] = [],
@@ -105,7 +106,7 @@ export function normalizeServiceText(input: string): string {
     .trim();
 }
 
-const CARRIER_WORDS: Record<Carrier, string> = { UPS: 'ups', USPS: 'usps', FedEx: 'fedex', DHL: 'dhl' };
+const CARRIER_WORDS: Record<KnownCarrier, string> = { UPS: 'ups', USPS: 'usps', FedEx: 'fedex', DHL: 'dhl' };
 
 /** Variant words providers append that do not change the underlying service. */
 const VARIANT_SUFFIX =
@@ -195,18 +196,39 @@ export function resolveService(input: string | null | undefined, options: Resolv
   return null;
 }
 
+/**
+ * Resolve a loose checkout ServiceSelection (from JSON, D1, a form) to its
+ * catalog entry, or null. The carrier is parsed with parseCarrier() first, so
+ * 'ups' / 'United Parcel Service' filter as UPS; an unrecognized carrier is
+ * dropped as a filter rather than blocking resolution. Tries `canonical`,
+ * then `code`, then `name`. Used by both exporters and reconcile, so the
+ * service a file is built for and the service a label is checked against
+ * always agree.
+ */
+export function resolveSelection(service: unknown): ServiceDefinition | null {
+  if (!service || typeof service !== 'object') return null;
+  const s = service as Partial<ServiceSelection>;
+  const carrier = parseCarrier(typeof s.carrier === 'string' ? s.carrier : undefined);
+  const opts: ResolveOptions = carrier ? { carrier } : {};
+  return resolveService(s.canonical, opts) ?? resolveService(s.code, opts) ?? resolveService(s.name, opts);
+}
+
 /** The plain ServiceSelection (carrier, code, name) for a catalog entry. */
 export function toSelection(entry: ServiceSelection): ServiceSelection {
   return { carrier: entry.carrier, code: entry.code, name: entry.name };
 }
 
-/** True when two selections denote the same canonical service. */
+/** True when two selections denote the same canonical service (`canonical` preferred over `code`). */
 export function sameService(a: ServiceSelection | null | undefined, b: ServiceSelection | null | undefined): boolean {
-  return !!a && !!b && a.carrier === b.carrier && a.code === b.code;
+  return !!a && !!b && a.carrier === b.carrier && (a.canonical ?? a.code) === (b.canonical ?? b.code);
+}
+
+export function isKnownCarrier(carrier: unknown): carrier is KnownCarrier {
+  return carrier === 'UPS' || carrier === 'USPS' || carrier === 'FedEx' || carrier === 'DHL';
 }
 
 /** Public tracking page for a carrier tracking number. */
-export function trackingUrl(carrier: Carrier, trackingNumber: string): string {
+export function trackingUrl(carrier: KnownCarrier, trackingNumber: string): string {
   const n = encodeURIComponent(trackingNumber.trim());
   switch (carrier) {
     case 'UPS':
@@ -221,7 +243,7 @@ export function trackingUrl(carrier: Carrier, trackingNumber: string): string {
 }
 
 /** Parse a free-text carrier name ("ups", "U.S. Postal Service", "FedEx Ground") to a Carrier. */
-export function parseCarrier(input: string | null | undefined): Carrier | null {
+export function parseCarrier(input: string | null | undefined): KnownCarrier | null {
   if (typeof input !== 'string') return null;
   const n = normalizeServiceText(input);
   if (!n) return null;
@@ -237,7 +259,7 @@ export function parseCarrier(input: string | null | undefined): Carrier | null {
  * the provider row names no carrier; returns null rather than guess when the
  * shape is shared between carriers.
  */
-export function inferCarrier(trackingNumber: string): Carrier | null {
+export function inferCarrier(trackingNumber: string): KnownCarrier | null {
   const t = trackingNumber.replace(/\s+/g, '').toUpperCase();
   if (/^1Z[0-9A-Z]{16}$/.test(t)) return 'UPS';
   if (/^(9[1-5]\d{18,24}|(EC|EA|CP|RA|LZ|LX)\d{9}US)$/.test(t)) return 'USPS';

@@ -6,11 +6,19 @@
  * Matching order per update:
  *  1. reference, exact;
  *  2. reference, case-insensitive (spreadsheets sometimes change case);
- *  3. recipient name + 5-digit ZIP, only when exactly one request matches.
+ *  3. recipient name + 5-digit ZIP, only when exactly one request matches,
+ *     and only for updates that carry NO reference. An update whose reference
+ *     matches no request goes to `unmatched`: in a full shipment-history
+ *     export it is usually an older order for the same (repeat) customer, and
+ *     attaching it by name would report the wrong label as shipped.
  * Updates that match nothing are returned in `unmatched`.
+ *
+ * The checkout service is resolved with the same resolveSelection() the
+ * exporters use. When it cannot be resolved to the catalog, labels are
+ * reported 'unverified' rather than compared on raw codes.
  */
 
-import { resolveService, sameService, toSelection } from './services';
+import { resolveSelection, sameService, toSelection } from './services';
 import type { ServiceSelection, ShipmentRequest, TrackingUpdate } from './types';
 
 export type MatchVia = 'reference' | 'reference-case-insensitive' | 'recipient';
@@ -30,7 +38,10 @@ export interface ServiceMismatch {
 
 export interface ReconcileEntry {
   reference: string;
+  /** The checkout service, canonicalized when it resolves to the catalog (see expectedResolved). */
   expected: ServiceSelection;
+  /** False when the checkout service is not in the catalog; serviceCheck is then never 'match'/'mismatch'. */
+  expectedResolved: boolean;
   parcelsExpected: number;
   matches: ReconcileMatch[];
   /** Distinct tracking numbers matched to this shipment. */
@@ -57,12 +68,6 @@ function nameKey(name: string | undefined, zip: string | undefined): string | nu
   return n && z.length === 5 ? `${n}|${z}` : null;
 }
 
-/** Canonicalize a loose checkout selection (e.g. code "03") so comparison is exact. */
-function canonical(service: ServiceSelection): ServiceSelection {
-  const opts = service?.carrier ? { carrier: service.carrier } : {};
-  const hit = resolveService(service?.code, opts) ?? resolveService(service?.name, opts);
-  return hit ? toSelection(hit) : service;
-}
 
 export function reconcileShipments(requests: readonly ShipmentRequest[], updates: readonly TrackingUpdate[]): ReconcileResult {
   const entries: ReconcileEntry[] = [];
@@ -73,9 +78,11 @@ export function reconcileShipments(requests: readonly ShipmentRequest[], updates
   for (const req of requests) {
     const reference = typeof req?.reference === 'string' ? req.reference.trim() : '';
     if (!reference || byRef.has(reference)) continue;
+    const hit = resolveSelection(req.service);
     const entry: ReconcileEntry = {
       reference,
-      expected: canonical(req.service),
+      expected: hit ? toSelection(hit) : req.service,
+      expectedResolved: !!hit,
       parcelsExpected: Math.max(1, Array.isArray(req.parcels) ? req.parcels.length : 0),
       matches: [],
       trackingNumbers: [],
@@ -107,7 +114,7 @@ export function reconcileShipments(requests: readonly ShipmentRequest[], updates
         }
       }
     }
-    if (!entry) {
+    if (!entry && !ref) {
       const rk = nameKey(update.recipientName, update.recipientPostalCode);
       const hits = rk ? byRecipient.get(rk) : undefined;
       if (hits?.length === 1) {
@@ -128,9 +135,9 @@ export function reconcileShipments(requests: readonly ShipmentRequest[], updates
     const n = entry.trackingNumbers.length;
     entry.status = n === 0 ? 'pending' : n < entry.parcelsExpected ? 'partial' : 'shipped';
     if (n === 0) continue;
-    let unverified = false;
+    let unverified = !entry.expectedResolved;
     for (const { update } of entry.matches) {
-      if (!update.service) {
+      if (!update.service || !entry.expectedResolved) {
         unverified = true;
         continue;
       }

@@ -45,11 +45,28 @@ export function guardFormula(cell: string): string {
   return cell;
 }
 
+/**
+ * Formula guard for a phone column: like guardFormula, but also passes a
+ * phone number with an extension ("+1 555-010-0199 ext. 5", "-555 0199 x12")
+ * unchanged. The only letters allowed are the extension marker, followed by
+ * digits only, so no function call, cell reference or DDE payload can form.
+ */
+export function guardPhone(cell: string): string {
+  if (/^[+-]?[0-9 ().\-]+(?:\s*(?:x|ext\.?|extension)\s*\d+)?$/i.test(cell) && /\d/.test(cell)) return cell;
+  return guardFormula(cell);
+}
+
 export type CsvCell = string | number | boolean | null | undefined;
 
+/** A per-cell guard: receives the cell text and its 0-based column index. */
+export type CellGuard = (cell: string, columnIndex: number) => string;
+
 export interface WriteCsvOptions {
-  /** Apply guardFormula to every cell (default true). */
-  formulaGuard?: boolean;
+  /**
+   * Apply guardFormula to every cell (default true), or pass a per-column
+   * guard function (e.g. guardPhone for a phone column, guardFormula elsewhere).
+   */
+  formulaGuard?: boolean | CellGuard;
   /** Prefix a UTF-8 BOM so Excel detects the encoding (default false). */
   bom?: boolean;
 }
@@ -70,14 +87,15 @@ export function escapeCsvField(text: string): string {
 
 /** Serialize rows to CSV. Every record, including the last, ends with CRLF. */
 export function writeCsv(rows: readonly (readonly CsvCell[])[], options: WriteCsvOptions = {}): string {
-  const guard = options.formulaGuard ?? true;
+  const g = options.formulaGuard ?? true;
+  const guard: CellGuard | null = typeof g === 'function' ? g : g ? guardFormula : null;
   let out = options.bom ? '﻿' : '';
   for (const row of rows) {
     out +=
       row
-        .map((v) => {
+        .map((v, col) => {
           const t = cellText(v);
-          return escapeCsvField(guard ? guardFormula(t) : t);
+          return escapeCsvField(guard ? guard(t, col) : t);
         })
         .join(',') + '\r\n';
   }
@@ -201,7 +219,10 @@ export function normalizeHeader(header: string): string {
 export interface CsvTableRow {
   /** 1-based physical record number (header is 1). */
   row: number;
-  /** Values keyed by the ORIGINAL header text. */
+  /**
+   * Values keyed by the ORIGINAL header text. A null-prototype object, so a
+   * header named "constructor" or "__proto__" is an ordinary key.
+   */
   values: Record<string, string>;
 }
 
@@ -228,9 +249,9 @@ export function parseCsvTable(input: string, options: ParseCsvOptions = {}): Csv
   const rows: CsvTableRow[] = [];
   for (let r = 1; r < records.length; r++) {
     const rec = records[r]!;
-    const values: Record<string, string> = {};
+    const values: Record<string, string> = Object.create(null);
     headers.forEach((h, idx) => {
-      if (h && !(h in values)) values[h] = rec[idx] ?? '';
+      if (h && !Object.hasOwn(values, h)) values[h] = rec[idx] ?? '';
     });
     rows.push({ row: recordNumbers[r]!, values });
   }

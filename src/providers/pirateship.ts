@@ -18,16 +18,21 @@
  * false) and contains no client for Pirate Ship's private web endpoints.
  *
  * Service selection: Pirate Ship's spreadsheet import has no carrier/service
- * column; the service is picked per batch in the UI when buying. So the
- * checkout service is carried in a visible "Requested Shipping Service"
- * column, exportBatches() produces one file per service, and
- * reconcileShipments() (../reconcile.ts) checks the export's Service column
- * against the order after purchase.
+ * column; the service is picked per batch in the UI when buying. So
+ * exportBatches() produces one file per (service, package type), each with a
+ * 'buy_with_service' instruction, and reconcileShipments() (../reconcile.ts)
+ * checks the export's Service column against the order after purchase. The
+ * checkout service is also written to a "Requested Shipping Service" column,
+ * but that column, like "Order Items", "Note" and "Phone", is not a native
+ * Pirate Ship field: it only survives into Pirate Ship (and its shipment
+ * export) when the operator maps it as Passthrough on the first upload. It
+ * does not print on the label. Every export carries a 'first_upload_mapping'
+ * info warning with the exact mapping (FIRST_UPLOAD_MAPPING).
  */
 
-import { isContiguousUs, isPoBox, missingAddressFields, normalizeCountry, normalizeUsState, normalizeUsZip } from '../address';
-import { parseCsvTable, writeCsv, type CsvCell } from '../csv';
-import { inferCarrier, parseCarrier, resolveService, toSelection, trackingUrl, type ServiceDefinition } from '../services';
+import { isContiguousUs, isIsoCountry, isPoBox, missingAddressFields, normalizeCountry, normalizeUsState, normalizeUsZip } from '../address';
+import { guardFormula, guardPhone, normalizeHeader, parseCsvTable, writeCsv, type CsvCell } from '../csv';
+import { inferCarrier, isKnownCarrier, parseCarrier, resolveSelection, resolveService, toSelection, trackingUrl, type ServiceDefinition } from '../services';
 import type {
   ExportFile,
   ExportResult,
@@ -87,6 +92,40 @@ export const PIRATE_SHIP_IMPORT_HEADERS = Object.freeze([
 ] as const);
 
 /**
+ * How to map PIRATE_SHIP_IMPORT_HEADERS on the first upload (Pirate Ship then
+ * remembers it by header text). Pirate Ship's mappable fields
+ * (pirateship.com/integrations/spreadsheets) are Name, Company, Address,
+ * Address Line 2/3, City, State, Zipcode, Country, Email Address, Weight,
+ * L/W/H, Order ID, Rubber Stamp and Passthrough. Columns with no native field
+ * must be mapped to Passthrough or they are dropped.
+ */
+export const FIRST_UPLOAD_MAPPING: Readonly<Record<(typeof PIRATE_SHIP_IMPORT_HEADERS)[number], string>> = Object.freeze({
+  'Order ID': 'Order ID',
+  'Full Name': 'Name',
+  Company: 'Company',
+  'Address Line 1': 'Address',
+  'Address Line 2': 'Address Line 2',
+  City: 'City',
+  State: 'State',
+  Zip: 'Zipcode',
+  Country: 'Country',
+  Email: 'Email Address',
+  Phone: 'Passthrough',
+  Pounds: 'Weight (pounds)',
+  Ounces: 'Weight (ounces)',
+  Length: 'Length',
+  Width: 'Width',
+  Height: 'Height',
+  'Rubber Stamp 1': 'Rubber Stamp 1',
+  'Rubber Stamp 2': 'Rubber Stamp 2',
+  'Requested Shipping Service': 'Passthrough',
+  'Order Items': 'Passthrough',
+  Note: 'Passthrough',
+});
+
+const PHONE_COLUMN = PIRATE_SHIP_IMPORT_HEADERS.indexOf('Phone');
+
+/**
  * Canonical service code -> Pirate Ship's spelling (pirateship.com/rates and
  * support article 5604653). Only UPS and USPS: Pirate Ship sells nothing else.
  */
@@ -112,11 +151,23 @@ export const PIRATE_SHIP_SERVICE_NAMES: Readonly<Record<string, string>> = Objec
   usps_priority_express_international: 'USPS Priority Mail Express International®',
 });
 
-/** Rubber stamp line lengths (article 1804193): USPS 25 chars; UPS 35 per line. */
+/**
+ * Rubber stamp line lengths (article 1804193): USPS 25 chars; UPS 35 per line.
+ * Overflow from Rubber Stamp 1 "moves to the next line", i.e. into the line
+ * Rubber Stamp 2 would use, so a long Order ID pushes Rubber Stamp 2 off.
+ */
 const STAMP_LIMIT = { USPS: 25, UPS: 35 } as const;
 
-/** Multi-parcel Order ID suffix: "ORDER-1" parcel 2 of 3 -> "ORDER-1/2of3". */
-const PARCEL_SUFFIX = /^(.+)\/(\d{1,3})of(\d{1,3})$/;
+/** Services whose labels print no rubber stamps (article 1804193). */
+const NO_STAMP_SERVICES: ReadonlySet<string> = new Set([
+  'ups_ground_saver',
+  'usps_first_class_international',
+  'usps_priority_international',
+  'usps_priority_express_international',
+]);
+
+/** Multi-parcel Order ID suffix: "ORDER-1" parcel 2 of 3 -> "ORDER-1/2of3". Case-insensitive on read ("/2OF3"). */
+const PARCEL_SUFFIX = /^(.+)\/(\d{1,3})of(\d{1,3})$/i;
 
 export function parcelOrderId(reference: string, index: number, count: number): string {
   return count > 1 ? `${reference}/${index}of${count}` : reference;
@@ -144,6 +195,8 @@ export interface PirateShipOptions {
 
 export interface PirateShipBatch extends ExportFile {
   service: ServiceSelection;
+  /** The requests' packageType (saved package to pick for this batch), when given. */
+  packageType?: string;
   /** Pirate Ship's name for the service to pick when buying this batch. */
   pirateShipService: string;
   references: string[];
@@ -165,6 +218,7 @@ export interface PirateShipProvider extends ShippingProvider {
 interface PreparedShipment {
   reference: string;
   service: ServiceDefinition;
+  packageType: string;
   rows: CsvCell[][];
 }
 
@@ -172,15 +226,28 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v.trim() : typeof v === 'number' && Number.isFinite(v) ? String(v) : '';
 }
 
-/** Finite positive number rounded to 2 decimals as a plain numeric string, else ''. */
+/** Finite positive number rounded to 2 decimals as a plain numeric string, else '' (also when it rounds to 0). */
 function num(v: unknown): string {
   if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return '';
-  return String(Math.round(v * 100) / 100);
+  const hundredths = Math.round(v * 100);
+  return hundredths === 0 ? '' : String(hundredths / 100);
+}
+
+/**
+ * Address text: drop a leading "- " / "+ " bullet ("- Rear" -> "Rear").
+ * Pirate Ship's importer is not a spreadsheet, so the formula guard's
+ * apostrophe would reach the label verbatim; a sign followed by whitespace
+ * is list punctuation, not data. A sign glued to text ("-SUM(A1)") is kept
+ * and still guarded.
+ */
+function addressText(v: unknown): string {
+  return str(v).replace(/^[+\-]+\s+(?=\S)/, '');
 }
 
 function splitWeight(weightOz: unknown): { pounds: string; ounces: string } | null {
   if (typeof weightOz !== 'number' || !Number.isFinite(weightOz) || weightOz <= 0) return null;
   const totalHundredths = Math.round(weightOz * 100);
+  if (totalHundredths === 0) return null;
   const lb = Math.floor(totalHundredths / 1600);
   const oz = (totalHundredths - lb * 1600) / 100;
   return { pounds: String(lb), ounces: String(oz) };
@@ -191,19 +258,19 @@ function sanitizeFilename(base: string): string {
   return s || 'pirateship-import';
 }
 
-function resolveRequestService(service: unknown): ServiceDefinition | null {
-  if (!service || typeof service !== 'object') return null;
-  const s = service as Partial<ServiceSelection>;
-  const carrier = s.carrier;
-  const opts = carrier === 'UPS' || carrier === 'USPS' || carrier === 'FedEx' || carrier === 'DHL' ? { carrier } : {};
-  return resolveService(s.code, opts) ?? resolveService(s.name, opts);
-}
-
-function itemsText(items: ShipmentRequest['items']): string {
+/** "N x description; ..." for the packing list. Calls onInvalid with each description whose quantity is not a positive integer. */
+function itemsText(items: ShipmentRequest['items'], onInvalid: (description: string, quantity: unknown) => void): string {
   if (!Array.isArray(items)) return '';
   return items
     .filter((i) => i && typeof i.description === 'string' && i.description.trim())
-    .map((i) => `${Number.isFinite(i.quantity) ? i.quantity : 1} x ${i.description.trim()}`)
+    .map((i) => {
+      const description = i.description.trim();
+      const raw: unknown = i.quantity;
+      const q = typeof raw === 'string' && raw.trim() !== '' ? Number(raw.trim()) : typeof raw === 'number' ? raw : NaN;
+      if (Number.isSafeInteger(q) && q > 0) return `${q} x ${description}`;
+      onInvalid(description, raw);
+      return `? x ${description}`;
+    })
     .join('; ');
 }
 
@@ -234,7 +301,7 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
     if (!reference) return skip('missing_reference', 'no order reference, so tracking could not be matched back.');
     if (seen.has(reference)) return skip('duplicate_reference', 'reference appears more than once; Pirate Ship needs one Order ID per row.');
 
-    const service = resolveRequestService(req.service);
+    const service = resolveSelection(req.service);
     if (!service) {
       const shown = req.service && typeof req.service === 'object' ? str(req.service.name) || str(req.service.code) : '';
       return skip('unknown_service', `checkout service "${shown}" is not a known service.`);
@@ -244,7 +311,7 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
 
     const to = (req.to ?? {}) as Partial<ShipmentRequest['to']>;
     let name = str(to.name);
-    const company = str(to.company);
+    const company = addressText(to.company);
     if (!name && company) {
       name = company;
       warn('info', 'name_from_company', `${reference}: no recipient name; using the company name.`, reference);
@@ -253,6 +320,9 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
     if (missing.length) return skip('missing_field', `recipient address is missing ${missing.join(', ')}.`);
 
     const country = normalizeCountry(to.country);
+    if (!isIsoCountry(country)) {
+      warn('warning', 'invalid_country', `${reference}: country "${str(to.country)}" is not a 2-letter ISO code; Pirate Ship may not recognize it.`, reference);
+    }
     let state = str(to.state);
     let zip = str(to.postalCode);
     if (country === 'US') {
@@ -277,8 +347,24 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
       if (country === 'US' && !isContiguousUs(state)) {
         warn('warning', 'ground_saver_area', `${reference}: UPS Ground Saver covers the contiguous 48 states only.`, reference);
       }
-      warn('info', 'no_rubber_stamps', `${reference}: rubber stamps do not print on UPS Ground Saver labels, so the order id will not show on the label.`, reference);
     }
+    const stampsPrint = !NO_STAMP_SERVICES.has(service.code);
+    if (!stampsPrint) {
+      warn('info', 'no_rubber_stamps', `${reference}: rubber stamps do not print on ${service.name} labels, so the order id will not show on the label; match the package to its packing list another way.`, reference);
+    }
+    if (req.customs !== undefined && country === 'US') {
+      warn('info', 'unsupported_option', `${reference}: customs info is ignored by the spreadsheet upload; complete it in Pirate Ship if needed.`, reference);
+    }
+    if (req.insuranceCents !== undefined) {
+      warn('info', 'unsupported_option', `${reference}: insurance cannot be set from a spreadsheet; add it in Pirate Ship when buying.`, reference);
+    }
+    if (req.options !== undefined) {
+      warn('info', 'unsupported_option', `${reference}: extra services (signature, etc.) cannot be set from a spreadsheet; choose them in Pirate Ship when buying.`, reference);
+    }
+    if (req.labelFormat !== undefined) {
+      warn('info', 'unsupported_option', `${reference}: label format is chosen in Pirate Ship (Settings > Label size), not per shipment.`, reference);
+    }
+    const packageType = str(req.packageType);
 
     let parcels = Array.isArray(req.parcels) ? req.parcels : [];
     const noParcels = parcels.length === 0;
@@ -293,6 +379,10 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
     }
 
     const stampLimit = STAMP_LIMIT[service.carrier as 'UPS' | 'USPS'];
+    const stamp2 = options.rubberStamp2 ?? '';
+    const items = itemsText(req.items, (description, quantity) =>
+      warn('warning', 'invalid_quantity', `${reference}: quantity ${JSON.stringify(quantity ?? null)} for "${description}" is not a positive whole number; shown as "?" on the packing list.`, reference),
+    );
     const rows: CsvCell[][] = [];
     parcels.forEach((p, idx) => {
       const orderId = parcelOrderId(reference, idx + 1, count);
@@ -305,15 +395,19 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
       if (given > 0 && given < 3) {
         warn('warning', 'partial_dimensions', `${orderId}: only some of length/width/height given; Pirate Ship needs all three.`, reference);
       }
-      if (orderId.length > stampLimit) {
-        warn('info', 'rubber_stamp_long', `${orderId}: longer than ${stampLimit} characters; Pirate Ship wraps then truncates the rubber stamp.`, reference);
+      if (stampsPrint && orderId.length > stampLimit) {
+        if (stamp2) {
+          warn('warning', 'rubber_stamp_overflow', `${orderId}: longer than ${stampLimit} characters; it wraps onto the next stamp line and pushes Rubber Stamp 2 ("${stamp2}") off the label.`, reference);
+        } else {
+          warn('info', 'rubber_stamp_long', `${orderId}: longer than ${stampLimit} characters; Pirate Ship wraps then truncates the rubber stamp.`, reference);
+        }
       }
       rows.push([
         orderId,
         name,
         company,
-        str(to.line1),
-        str(to.line2),
+        addressText(to.line1),
+        addressText(to.line2),
         str(to.city),
         state,
         zip,
@@ -326,33 +420,69 @@ function prepare(requests: unknown, options: PirateShipOptions): { prepared: Pre
         dims[1],
         dims[2],
         orderId,
-        options.rubberStamp2 ?? '',
+        stamp2,
         psName,
-        itemsText(req.items),
+        items,
         str(req.notes),
       ]);
     });
 
     seen.add(reference);
-    prepared.push({ reference, service, rows });
+    prepared.push({ reference, service, packageType, rows });
   });
 
+  const stamp2 = options.rubberStamp2 ?? '';
+  if (stamp2) {
+    for (const carrier of new Set(prepared.map((p) => p.service.carrier as 'UPS' | 'USPS'))) {
+      if (stamp2.length > STAMP_LIMIT[carrier]) {
+        warn('warning', 'rubber_stamp_long', `Rubber Stamp 2 "${stamp2}" is longer than ${STAMP_LIMIT[carrier]} characters for ${carrier} labels and will be wrapped or truncated.`);
+      }
+    }
+  }
+  if (prepared.length) {
+    warn(
+      'info',
+      'first_upload_mapping',
+      'First upload only (Pirate Ship remembers it): map ' +
+        Object.entries(FIRST_UPLOAD_MAPPING)
+          .map(([from, to]) => `${from} -> ${to}`)
+          .join(', ') +
+        '. Unmapped columns are dropped.',
+    );
+  }
   return { prepared, warnings, skipped };
 }
 
-/** Group prepared shipments by service, in order of first appearance; input order kept within a group. */
-function groupByService(prepared: PreparedShipment[]): Map<string, PreparedShipment[]> {
+/**
+ * Group prepared shipments by key, in order of first appearance; input order
+ * kept within a group.
+ */
+function groupBy(prepared: PreparedShipment[], key: (p: PreparedShipment) => string): Map<string, PreparedShipment[]> {
   const groups = new Map<string, PreparedShipment[]>();
   for (const p of prepared) {
-    const g = groups.get(p.service.code) ?? [];
+    const k = key(p);
+    const g = groups.get(k) ?? [];
     g.push(p);
-    groups.set(p.service.code, g);
+    groups.set(k, g);
   }
   return groups;
 }
 
+const groupByService = (prepared: PreparedShipment[]) => groupBy(prepared, (p) => p.service.code);
+
+function cellGuard(cell: string, column: number): string {
+  return column === PHONE_COLUMN ? guardPhone(cell) : guardFormula(cell);
+}
+
 function toCsv(shipments: PreparedShipment[], options: PirateShipOptions): string {
-  return writeCsv([[...PIRATE_SHIP_IMPORT_HEADERS], ...shipments.flatMap((s) => s.rows)], { bom: options.bom ?? false });
+  return writeCsv([[...PIRATE_SHIP_IMPORT_HEADERS], ...shipments.flatMap((s) => s.rows)], {
+    bom: options.bom ?? false,
+    formulaGuard: cellGuard,
+  });
+}
+
+function packageSlug(packageType: string): string {
+  return packageType.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'package';
 }
 
 function serviceGroupWarning(groups: Map<string, PreparedShipment[]>): ExportWarning | null {
@@ -396,6 +526,17 @@ const COLS = {
   zip: ['Zip', 'Zipcode', 'Zip Code', 'Postal Code', 'Postcode', 'ZIP/Postal Code'],
   status: ['Tracking Status', 'Status', 'Label Status', 'Shipment Status'],
 } as const;
+
+const REFUND_TEXT = /\b(refund|refunded|refund requested|void|voided|cancel|cancelled|canceled)\b/i;
+
+/** Every column that may carry a label/refund state: the status aliases, plus any header mentioning status, refund or void. */
+function statusLikeColumns(headers: readonly string[]): string[] {
+  const aliases = new Set(COLS.status.map(normalizeHeader));
+  return headers.filter((h) => {
+    const n = normalizeHeader(h);
+    return n !== '' && (aliases.has(n) || n.includes('status') || n.includes('refund') || n.includes('void'));
+  });
+}
 
 /**
  * Undo spreadsheet text-forcing on a cell: ="00123" -> 00123, and our own
@@ -483,6 +624,7 @@ function parseTracking(text: string): TrackingImportResult {
     return { updates, errors };
   }
   const get = (values: Record<string, string>, h: string | undefined) => (h ? cleanCell(values[h]) : '');
+  const statusCols = statusLikeColumns(table.headers);
   const seen = new Set<string>();
 
   for (const { row, values } of table.rows) {
@@ -492,8 +634,9 @@ function parseTracking(text: string): TrackingImportResult {
       errors.push({ row, message: 'No tracking number; row skipped.' });
       continue;
     }
-    if (status && /\b(refund|refunded|void|voided|cancel|cancelled|canceled)\b/i.test(status)) {
-      errors.push({ row, message: `Label ${trackingNumber} is "${status}"; row skipped.` });
+    const refundCol = statusCols.find((h) => REFUND_TEXT.test(get(values, h)));
+    if (refundCol) {
+      errors.push({ row, message: `Label ${trackingNumber} is "${get(values, refundCol)}" (${refundCol}); row skipped.` });
       continue;
     }
     if (seen.has(trackingNumber)) {
@@ -527,7 +670,7 @@ function parseTracking(text: string): TrackingImportResult {
     const zip = get(values, col.zip);
     if (zip) update.recipientPostalCode = zip;
     if (status) update.status = status;
-    update.raw = { ...values };
+    update.raw = Object.assign(Object.create(null) as Record<string, string>, values);
     updates.push(update);
   }
   return { updates, errors };
@@ -539,7 +682,7 @@ export function createPirateShipProvider(options: PirateShipOptions = {}): Pirat
     id: PIRATE_SHIP_ID,
     displayName: PIRATE_SHIP_DISPLAY_NAME,
     appUrl: PIRATE_SHIP_APP_URL,
-    capabilities: Object.freeze({ exportFile: true, importTracking: true, purchaseLabel: false, rates: false }),
+    capabilities: Object.freeze({ exportFile: true, importTracking: true, purchaseLabel: false, rates: false, track: false, voidLabel: false }),
 
     exportShipments(requests) {
       const { prepared, warnings, skipped } = prepare(requests, options);
@@ -547,6 +690,17 @@ export function createPirateShipProvider(options: PirateShipOptions = {}): Pirat
       const ordered = [...groups.values()].flat();
       const sw = serviceGroupWarning(groups);
       if (sw) warnings.push(sw);
+      const pkgs = groupBy(prepared, (p) => p.packageType);
+      if (pkgs.size > 1) {
+        warnings.push({
+          level: 'warning',
+          code: 'mixed_package_types',
+          message:
+            'Pirate Ship takes one package selection per upload; this file mixes package types (use exportBatches for one file per service and package): ' +
+            [...pkgs].map(([k, g]) => `${k || '(default)'}: ${g.map((s) => s.reference).join(', ')}`).join(' | '),
+          references: prepared.map((p) => p.reference),
+        });
+      }
       return {
         filename: `${base}.csv`,
         mimeType: 'text/csv;charset=utf-8',
@@ -559,21 +713,27 @@ export function createPirateShipProvider(options: PirateShipOptions = {}): Pirat
     exportBatches(requests) {
       const { prepared, warnings, skipped } = prepare(requests, options);
       const batches: PirateShipBatch[] = [];
-      for (const [code, group] of groupByService(prepared)) {
+      // One file per (service, package type): Pirate Ship takes the service
+      // and the package selection per batch, not per row.
+      for (const group of groupBy(prepared, (p) => `${p.service.code}\u0000${p.packageType}`).values()) {
+        const { code } = group[0]!.service;
+        const packageType = group[0]!.packageType;
         const psName = PIRATE_SHIP_SERVICE_NAMES[code]!;
         const references = group.map((g) => g.reference);
+        const filename = packageType ? `${base}-${code}-${packageSlug(packageType)}.csv` : `${base}-${code}.csv`;
         batches.push({
-          filename: `${base}-${code}.csv`,
+          filename,
           mimeType: 'text/csv;charset=utf-8',
           content: toCsv(group, options),
           service: toSelection(group[0]!.service),
+          ...(packageType ? { packageType } : {}),
           pirateShipService: psName,
           references,
         });
         warnings.push({
           level: 'info',
           code: 'buy_with_service',
-          message: `${base}-${code}.csv: choose ${psName} for every label in this batch.`,
+          message: `${filename}: choose ${psName}${packageType ? ` and the "${packageType}" package` : ''} for every label in this batch.`,
           references,
         });
       }
@@ -586,5 +746,5 @@ export function createPirateShipProvider(options: PirateShipOptions = {}): Pirat
 
 /** Convenience: tracking URL for an update, or null when the carrier is unknown. */
 export function trackingUrlFor(update: Pick<TrackingUpdate, 'carrier' | 'trackingNumber'>): string | null {
-  return update.carrier ? trackingUrl(update.carrier, update.trackingNumber) : null;
+  return isKnownCarrier(update.carrier) ? trackingUrl(update.carrier, update.trackingNumber) : null;
 }

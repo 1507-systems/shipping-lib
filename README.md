@@ -55,7 +55,7 @@ person drives both of them in the Pirate Ship web app:
 | 3 | Operator | Shipments grid (blank search) > Export, or a batch's "Export Data". Use CSV (Settings > General Settings > Spreadsheet Export Filetype) |
 | 4 | Code | `parseTrackingImport()` turns that file into `TrackingUpdate[]`. `reconcileShipments()` joins it to orders and checks the service |
 
-`capabilities` is `{ exportFile: true, importTracking: true, purchaseLabel: false, rates: false }`.
+`capabilities` is `{ exportFile: true, importTracking: true, purchaseLabel: false, rates: false, track: false, voidLabel: false }`.
 
 ### The upload CSV
 
@@ -66,18 +66,23 @@ then remembers the mapping by header text:
 Order ID,Full Name,Company,Address Line 1,Address Line 2,City,State,Zip,Country,Email,Phone,Pounds,Ounces,Length,Width,Height,Rubber Stamp 1,Rubber Stamp 2,Requested Shipping Service,Order Items,Note
 ```
 
-Suggested one-time mapping in Pirate Ship's import dialog:
+One-time mapping in Pirate Ship's import dialog (also exported as
+`FIRST_UPLOAD_MAPPING`, and repeated in every export's `first_upload_mapping`
+info warning). Columns left unmapped are dropped:
 
 | Column | Map to |
 |---|---|
 | Order ID | Order ID |
-| Full Name, Company, Address Line 1, Address Line 2, City, State, Zip, Country, Email | the matching address fields |
-| Phone | Phone if offered, otherwise Passthrough |
+| Full Name | Name |
+| Company, City, State, Country | the field of the same name |
+| Address Line 1 / Address Line 2 | Address / Address Line 2 |
+| Zip | Zipcode |
+| Email | Email Address |
 | Pounds / Ounces | Package Weight (pounds / ounces), Override |
 | Length / Width / Height | Package dimensions, Override |
 | Rubber Stamp 1 | Rubber Stamp 1 (prints the order id on the label, for matching it to the packing list) |
 | Rubber Stamp 2 | Rubber Stamp 2 (optional fixed text, `rubberStamp2` option) |
-| Requested Shipping Service, Order Items, Note | Passthrough (visible in the grid and carried into exports) |
+| Phone, Requested Shipping Service, Order Items, Note | Passthrough (not native Pirate Ship fields; they never print on the label) |
 
 Row rules:
 
@@ -89,7 +94,16 @@ Row rules:
   wants numbers only. A missing or invalid weight or dimension is left blank,
   so Pirate Ship's batch "Default" package applies, and a warning is emitted.
 - For US addresses, state names are normalized to 2-letter codes and 9-digit
-  ZIPs to `NNNNN-NNNN`.
+  ZIPs to `NNNNN-NNNN`. Common country names ("Canada", "United Kingdom")
+  become ISO alpha-2; anything else that is not 2 letters gets
+  `invalid_country`.
+- A leading `- ` / `+ ` bullet on name/company/address lines is dropped
+  (`- Rear` -> `Rear`) instead of being formula-guarded, because Pirate Ship's
+  importer is not a spreadsheet and would keep the guard apostrophe.
+- Item quantities may be numbers or numeric strings; anything that is not a
+  positive whole number prints as `?` with an `invalid_quantity` warning.
+- `customs`, `insuranceCents`, `options` and `labelFormat` cannot be set from
+  a spreadsheet; they produce `customs_required` / `unsupported_option` info.
 - A shipment is **skipped**, and listed in `skipped` with a warning, when it
   has no reference, a duplicate reference, an unknown service, a service
   Pirate Ship does not sell (FedEx, DHL), or a missing required address field
@@ -98,8 +112,11 @@ Row rules:
   Codes include `missing_field`, `invalid_state`, `invalid_zip`,
   `invalid_weight`, `partial_dimensions`, `no_parcels`, `customs_required`,
   `service_destination_mismatch`, `ground_saver_po_box`, `ground_saver_area`,
-  `no_rubber_stamps`, `rubber_stamp_long`, `mixed_services` and
-  `buy_with_service`.
+  `no_rubber_stamps` (UPS Ground Saver and USPS international labels print no
+  stamps), `rubber_stamp_long`, `rubber_stamp_overflow` (a long Order ID wraps
+  into the line Rubber Stamp 2 needs and pushes it off), `invalid_country`,
+  `invalid_quantity`, `unsupported_option`, `mixed_services`,
+  `mixed_package_types`, `first_upload_mapping` and `buy_with_service`.
 
 ### Matching the checkout service
 
@@ -107,16 +124,26 @@ Pirate Ship's spreadsheet import **cannot set the carrier or service per
 row**: the service is chosen per batch when buying. The library enforces the
 checkout method in three places:
 
-1. **Visible:** every row carries Pirate Ship's own spelling of the checkout
+1. **Carried:** every row carries Pirate Ship's own spelling of the checkout
    service, such as `UPS® Ground` or `UPS 2nd Day Air®`, in
-   `Requested Shipping Service`.
-2. **Grouped:** `exportBatches()` writes one CSV per service, for example
-   `pirateship-import-ups_ground.csv`, and names the service to pick for each.
+   `Requested Shipping Service`. It reaches Pirate Ship's grid and exports only
+   if mapped as Passthrough, and it does not print on the label.
+2. **Grouped:** `exportBatches()` writes one CSV per service and package type
+   (`ShipmentRequest.packageType`), for example
+   `pirateship-import-ups_ground.csv`, and names the service (and package) to
+   pick for each.
    `exportShipments()` writes a single file sorted by service. When the file
    mixes services it adds a `mixed_services` warning that lists each group.
 3. **Verified:** after purchase, `reconcileShipments(requests, updates)` reads
    the export's `Service` column and flags any label whose service differs
-   from checkout (`serviceCheck: 'mismatch'`).
+   from checkout (`serviceCheck: 'mismatch'`). The checkout service is
+   resolved with `resolveSelection()`, the same resolver the exporter uses,
+   so a loose `{ carrier: 'ups', code: '01' }` checks as UPS Next Day Air. A
+   checkout service outside the catalog yields `'unverified'`, never a
+   raw-code mismatch. Updates are joined by reference; the recipient
+   name + ZIP fallback is used only for rows with no Order ID, so an old
+   order's label in a full history export is never attached to a repeat
+   customer's new order (it lands in `unmatched`).
 
 ## Usage
 
@@ -181,6 +208,10 @@ the parser never throws. Before quoting, every written cell goes through
   one digit). That exception keeps `+1 (555) 010-0199` and `-12.5` intact:
   those characters can't form a function call, a cell reference or a DDE
   payload. `-SUM(A1)` and `+cmd|...` are still neutralized.
+- `guardPhone` additionally passes a trailing extension
+  (`+1 555-010-0199 ext. 5`, `x12`). `writeCsv` takes `formulaGuard` as a
+  per-column function, and the Pirate Ship export uses `guardPhone` for the
+  Phone column only.
 
 Tracking import reverses the guard on reference cells. It also unwraps
 Excel's `="..."` text-forcing, so references and tracking numbers round-trip
@@ -199,12 +230,23 @@ export function createExampleApiProvider(opts: { apiKey: string; fetch?: typeof 
     id: 'example',
     displayName: 'Example Labels',
     appUrl: 'https://app.example.com',
-    capabilities: { exportFile: false, importTracking: false, purchaseLabel: true, rates: true },
+    capabilities: { exportFile: false, importTracking: false, purchaseLabel: true, rates: true, track: true, voidLabel: true },
+    // Return each quote's provider rate id (rateId) so the exact quote can be bought.
     async getRates(req) { /* POST to the provider's documented API */ return []; },
-    async purchaseLabel(req) { /* ... */ throw new Error('not implemented'); },
+    // One label per parcel (labels[i].parcel). Pass idempotencyKey to the API so a retry never buys twice.
+    async purchaseLabel(req, { rateId, idempotencyKey }) { /* ... */ return { labels: [] }; },
+    async getTracking(trackingNumber) { return null; },
+    async voidLabel(label) { return { accepted: false }; },
   };
 }
 ```
+
+`Carrier` is open (`KnownCarrier | string`), so an aggregator can report
+carriers outside the catalog (OnTrac, Canada Post). When a provider uses its
+own service code, set `ServiceSelection.canonical` to the catalog id when one
+exists so `sameService`/`reconcileShipments` still compare exactly.
+`ShipmentRequest` also carries optional `customs`, `insuranceCents`,
+`options` (signature, etc.), `packageType` and `labelFormat`.
 
 Put it in `src/providers/<id>.ts`, add a `src/<id>.ts` subpath entry and a
 matching `exports` entry in `package.json`, and use the canonical service
