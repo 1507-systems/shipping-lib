@@ -1,0 +1,8 @@
+name: Close Cortex Issues
+on:
+  push:
+    branches: [main]
+jobs:
+  close:
+    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@da3d7227985b583e9f61788b415ca0dec98353ef
+    secrets: inherit

@@ -1,0 +1,28 @@
+{
+  "name": "@1507-systems/shipping-lib",
+  "version": "0.1.0",
+  "description": "Provider-agnostic shipping-label layer: canonical service catalog, RFC 4180 CSV with formula-injection guard, provider registry, and a Pirate Ship provider built on its sanctioned spreadsheet-import and shipment-export routes. Zero runtime deps, Web-standard only.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./pirateship": "./src/pirateship.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1507-systems/shipping-lib.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
